@@ -2,42 +2,27 @@ name = "queue-worker"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
-# NOTE: tail_consumers → alert-worker intentionally omitted for now — see
-# integration-worker's wrangler.toml for why (code 100150, Workers Paid
-# plan required for Tail Workers). Add once billing status is resolved:
-# tail_consumers = [{ service = "alert-worker" }]
+tail_consumers = [{ service = "alert-worker" }]
 
 [[kv_namespaces]]
 binding = "LEADS_SYNC_CACHE"
 id = "5bdb23b812e54e0fbd9b70dfa25cd5db"
 
-# Producer bindings — this Worker only ever forwards messages onward, never
-# calls an external API directly.
-[[queues.producers]]
-binding = "INTEGRATION_QUEUE"
-queue = "integration-queue"
+# Replaces the old INTEGRATION_QUEUE producer — per-lead traffic goes
+# through a direct Service Binding call now instead of a queue message,
+# since Queues operations have a 10k/day budget on the free plan and
+# Service Binding calls don't count against it. See worker.js file header.
+[[services]]
+binding = "INTEGRATION_WORKER"
+service = "integration-worker"
 
-[[queues.producers]]
-binding = "DIGEST_QUEUE"
-queue = "digest-accumulate-queue"
-
-# Main consumer. No max_concurrency cap — every write here is independent
-# per-cacheKey, not a shared-key read-modify-write like the digest bucket,
-# so there's no race to guard against.
-[[queues.consumers]]
-queue = "discovered-leads-queue"
-max_batch_size = 10
-max_batch_timeout = 30
-max_retries = 3
-dead_letter_queue = "discovered-leads-dlq"
-
-# Dead-letter consumer — backstop alerting for anything that lands here.
-[[queues.consumers]]
-queue = "discovered-leads-dlq"
-max_batch_size = 10
-max_retries = 3
+# Replaces the old DIGEST_QUEUE producer — same reasoning as above.
+[[services]]
+binding = "DIGEST_WORKER"
+service = "digest-worker"
 
 [observability.logs]
 enabled = true
 invocation_logs = true
 head_sampling_rate = 0.2
+
