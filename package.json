@@ -1,0 +1,11 @@
+{
+  "name": "queue-worker",
+  "version": "1.0.0",
+  "description": "Deduplicates and routes each discovered lead to the correct downstream delivery queue (integration-queue or digest-accumulate-queue).",
+  "type": "module",
+  "main": "worker.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {}
+}
