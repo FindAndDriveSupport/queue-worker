@@ -4,109 +4,101 @@
  * The "processes each lead" stage. Sits between cron-worker (finds leads)
  * and the delivery workers (integration-worker for HubSpot/CMS/VMG,
  * digest-worker for the email digest). Owns exactly one responsibility:
- * per-destination deduplication and routing. No external API calls at all
- * — this Worker only ever talks to KV and other queues, so like
- * cron-worker's dispatch stage, it can never run out of subrequest budget
- * regardless of lead volume.
+ * per-destination deduplication and routing.
  *
  * ─────────────────────────────────────────────────────────────────────────
- * MESSAGE CONTRACT — discovered-leads-queue (consumed here, produced by cron-worker)
+ * NO LONGER A QUEUE CONSUMER — called directly via Service Binding
  * ─────────────────────────────────────────────────────────────────────────
- * ONE message per LEAD (not per lead-destination pair) — cron-worker fetches
- * a branch's leads, runs Kredo enrichment once per lead if applicable, and
- * hands off the whole lead with its full resolved destinations array:
- *   { dealerKey, branchCode, intent, lead, approvalChance, destinations }
+ * Originally consumed discovered-leads-queue. Converted to a Service
+ * Binding target (cron-worker calls env.QUEUE_WORKER.fetch(...) directly)
+ * because Cloudflare Queues costs ~3 operations per message and has a
+ * 10k/day budget on the free plan — per-LEAD traffic through a queue here
+ * blew well past that. Service Binding calls are billed as ordinary
+ * Workers requests instead, not Queues operations. See cron-worker's file
+ * header "QUEUES OPERATIONS BUDGET" note for the full numbers.
+ *
+ * This Worker in turn calls integration-worker and digest-worker the same
+ * way — direct Service Binding fetch() calls, not queue messages. The
+ * ENTIRE per-lead path (cron-worker → queue-worker → integration-worker /
+ * digest-worker) is now queue-free. The only real queue left anywhere in
+ * this pipeline is branch-fetch-queue inside cron-worker, which
+ * deliberately stays a queue (see its file header for why).
+ *
+ * TRADE-OFF WORTH KNOWING: Service Binding calls are synchronous, unlike
+ * fire-and-forget queue messages. cron-worker now waits for this Worker to
+ * finish (which itself waits for integration-worker/digest-worker to
+ * finish) before moving to the next lead. Retry is also no longer
+ * automatic — a failed call here means cron-worker's lead-level dedup
+ * marker (see its file header) is never written, so the same lead gets
+ * retried whole on the NEXT dispatch tick (up to 30 min later) rather than
+ * a queue's near-immediate automatic retry. Acceptable for this volume;
+ * revisit if per-branch invocation duration becomes a real problem.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * CALL CONTRACT — POST /process-lead (from cron-worker)
+ * ─────────────────────────────────────────────────────────────────────────
+ * Body: { dealerKey, branchCode, intent, lead, approvalChance, destinations }
  * — destinations is the dealer's already-resolved array (shared CMS/VMG
- *   credentials merged in upstream, same as before) — this Worker doesn't
- *   need to know about __shared_credentials__ at all.
+ *   credentials merged in upstream by cron-worker's dispatch stage).
  *
  * For EACH destination in that array, this Worker:
  *   1. Computes the same cacheKey scheme used throughout the pipeline:
  *      branchCode ? `${dealerKey}-${branchCode}-${intent}-${dest.type}-${uniqueId}-${lead.date}`
  *                 : `${dealerKey}-${intent}-${dest.type}-${uniqueId}-${lead.date}`
  *   2. Checks LEADS_SYNC_CACHE[cacheKey] — skips if already "queued" (in
- *      flight) or "1" (done). This is the ONE place dedup decisions get
- *      made now — cron-worker doesn't check the cache at all, keeping its
- *      job purely "fetch and hand off."
- *   3. Routes to the right downstream queue:
- *        dest.type === "email"  → DIGEST_QUEUE  (digest-accumulate-queue)
- *          message: { dealerKey, branchCode, intent, lead, cacheKey }
+ *      flight) or "1" (done).
+ *   3. Calls the right downstream Worker via Service Binding:
+ *        dest.type === "email"  → DIGEST_WORKER  POST /accumulate
+ *          body: { dealerKey, branchCode, intent, lead, cacheKey }
  *          — no dest needed; digest-worker never used one, even before.
- *        anything else          → INTEGRATION_QUEUE (integration-queue)
- *          message: { dealerKey, branchCode, intent, dest, lead, approvalChance, cacheKey }
+ *        anything else          → INTEGRATION_WORKER  POST /deliver
+ *          body: { dealerKey, branchCode, intent, dest, lead, approvalChance, cacheKey }
  *   4. Marks LEADS_SYNC_CACHE[cacheKey] = "queued" (1hr TTL) immediately
- *      after a successful send — prevents cron-worker's next 5-min tick
- *      from causing this same lead-destination pair to be routed twice
- *      while the downstream delivery is still in flight. The delivery
+ *      before calling — same "in flight" marker purpose as before, just
+ *      renamed conceptually now that there's no queue. The delivery
  *      workers themselves flip this to "1" (7-day TTL) once actually
  *      delivered — this Worker never writes the "done" state, only "queued".
  *
+ * Returns { routedCount } on success.
+ *
  * REQUIRED wrangler.toml:
  *   [[kv_namespaces]] binding = "LEADS_SYNC_CACHE"
- *   [[queues.producers]] binding = "INTEGRATION_QUEUE" queue = "integration-queue"
- *   [[queues.producers]] binding = "DIGEST_QUEUE" queue = "digest-accumulate-queue"
- *   [[queues.consumers]] queue = "discovered-leads-queue"
- *     max_batch_size = 10, max_retries = 3, dead_letter_queue = "discovered-leads-dlq"
- *     (no max_concurrency cap needed — this Worker has no shared mutable
- *     state of its own; LEADS_SYNC_CACHE writes here are all independent
- *     per-cacheKey, not a read-modify-write on one shared key like the
- *     digest bucket is)
- *   [[queues.consumers]] queue = "discovered-leads-dlq"
- *     max_batch_size = 10, max_retries = 3
+ *   [[services]] binding = "INTEGRATION_WORKER" service = "integration-worker"
+ *   [[services]] binding = "DIGEST_WORKER" service = "digest-worker"
  */
 
 const QUEUED_MARKER_TTL = 3600; // 1 hour — matches the dedup cache's existing "in flight" TTL scheme.
-const MAX_QUEUE_RETRIES = 3;    // keep in sync with discovered-leads-queue's max_retries in wrangler.toml.
 
 export default {
-  async fetch(request) {
-    return new Response("queue-worker", { status: 200 });
-  },
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
 
-  async queue(batch, env, ctx) {
-    if (batch.queue === "discovered-leads-dlq") {
-      return handleDeadLetterBatch(batch);
+    if (url.pathname === "/process-lead" && request.method === "POST") {
+      try {
+        const body = await request.json();
+        const routedCount = await processDiscoveredLead(body, env);
+        console.log(`✅ [queue-worker] Routed ${routedCount} destination(s) for one lead.`);
+        return new Response(JSON.stringify({ routedCount }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (err) {
+        console.error(`❌ [queue-worker] Failed to process lead: ${err.message}`);
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
     }
-    return handleDiscoveredLeadsBatch(batch, env);
+
+    return new Response("queue-worker", { status: 200 });
   },
 };
 
-async function handleDiscoveredLeadsBatch(batch, env) {
-  for (const message of batch.messages) {
-    try {
-      const routedCount = await processDiscoveredLead(message.body, env);
-      console.log(`✅ [queue-worker] Routed ${routedCount} destination(s) for one lead.`);
-      message.ack();
-    } catch (err) {
-      const { dealerKey, branchCode } = message.body;
-      const label = branchCode ? `${dealerKey} [${branchCode}]` : dealerKey;
-      const isFinalAttempt = message.attempts > MAX_QUEUE_RETRIES;
-
-      if (isFinalAttempt) {
-        console.error(`❌ [DEAD LETTER] Lead routing permanently failed for ${label} after ${message.attempts} attempts: ${err.message}`);
-      } else {
-        console.log(`⚠️  [queue-worker] Attempt ${message.attempts} failed for ${label}, will retry: ${err.message}`);
-      }
-      message.retry();
-    }
-  }
-}
-
-async function handleDeadLetterBatch(batch) {
-  for (const message of batch.messages) {
-    const { dealerKey, branchCode, intent, lead } = message.body;
-    const label = branchCode ? `${dealerKey} [${branchCode}]` : dealerKey;
-    console.error(
-      `❌ [DEAD LETTER QUEUE] Lead routing for ${label} landed in DLQ. ` +
-      `Lead: ${lead?.firstName} ${lead?.lastName} (${lead?.mobileNumber}), intent: ${intent}. Needs manual review.`
-    );
-    message.ack();
-  }
-}
-
 // Processes ONE discovered lead: fans it out across its destinations,
-// deduplicating and routing each. Returns how many destinations were
-// actually newly routed (excludes ones skipped as already queued/done).
+// deduplicating and calling the right delivery Worker for each. Returns
+// how many destinations were actually newly routed (excludes ones skipped
+// as already queued/done).
 async function processDiscoveredLead(msg, env) {
   const { dealerKey, branchCode, intent, lead, approvalChance, destinations } = msg;
   const uniqueId = lead.idNumber || lead.mobileNumber || "unknown";
@@ -121,14 +113,33 @@ async function processDiscoveredLead(msg, env) {
     const cached = await env.LEADS_SYNC_CACHE.get(cacheKey);
     if (cached) continue; // already "queued" (in flight) or "1" (done) — skip.
 
-    if (dest.type === "email") {
-      await env.DIGEST_QUEUE.send({ dealerKey, branchCode, intent, lead, cacheKey });
-    } else {
-      await env.INTEGRATION_QUEUE.send({ dealerKey, branchCode, intent, dest, lead, approvalChance, cacheKey });
-    }
-
     await env.LEADS_SYNC_CACHE.put(cacheKey, "queued", { expirationTtl: QUEUED_MARKER_TTL });
-    routedCount++;
+
+    try {
+      if (dest.type === "email") {
+        const res = await env.DIGEST_WORKER.fetch("https://internal/accumulate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ dealerKey, branchCode, intent, lead, cacheKey }),
+        });
+        if (!res.ok) throw new Error(`digest-worker responded ${res.status}`);
+      } else {
+        const res = await env.INTEGRATION_WORKER.fetch("https://internal/deliver", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ dealerKey, branchCode, intent, dest, lead, approvalChance, cacheKey }),
+        });
+        if (!res.ok) throw new Error(`integration-worker responded ${res.status}`);
+      }
+      routedCount++;
+    } catch (err) {
+      console.error(`  ❌ [queue-worker] Failed to route [${dest.type}] for ${cacheKey}: ${err.message}`);
+      // Deliberately leave the "queued" marker in place rather than
+      // deleting it — a delivery Worker failure here is usually transient
+      // (network blip, downstream API hiccup). Since this marker has a
+      // 1-hour TTL, it'll expire and the NEXT lead-forward retry from
+      // cron-worker will pick this destination back up naturally.
+    }
   }
 
   return routedCount;
