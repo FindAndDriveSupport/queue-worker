@@ -14,19 +14,15 @@ jobs:
           node-version: '20'
       - name: Install dependencies
         run: npm install
-      # TEMPORARY — one-off fix for a stale queue consumer registration left
-      # over from before queue-worker was converted to Service Bindings.
-      # Dashboard removal (Queues → discovered-leads-queue → Settings →
-      # Consumer details) didn't clear it, so forcing it via wrangler CLI
-      # directly. REMOVE THIS STEP once a deploy succeeds — it's a one-time
-      # fix, not something that should run on every future deploy.
-      - name: One-off — force-remove stale queue consumer
+      - name: One-off - force-remove stale queue consumer
         run: npx wrangler queues consumer remove discovered-leads-queue queue-worker
+        continue-on-error: true
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      - name: One-off — force-remove stale DLQ consumer
+      - name: One-off - force-remove stale DLQ consumer
         run: npx wrangler queues consumer remove discovered-leads-dlq queue-worker
+        continue-on-error: true
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
