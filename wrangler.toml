@@ -24,5 +24,5 @@ service = "digest-worker"
 [observability.logs]
 enabled = true
 invocation_logs = true
-head_sampling_rate = 1.0
+head_sampling_rate = 0.2
 
