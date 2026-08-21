@@ -53,13 +53,22 @@
  *          — no dest needed; digest-worker never used one, even before.
  *        anything else          → INTEGRATION_WORKER  POST /deliver
  *          body: { dealerKey, branchCode, intent, dest, lead, approvalChance, cacheKey }
+ *          — response body on success: { ok: true, externalLeadId } —
+ *            externalLeadId (CRM-assigned contact/lead ID) is captured
+ *            and logged here, then included in this Worker's own
+ *            response under routedResults. digest-worker never returns
+ *            one, so externalLeadId stays null for "email" destinations.
  *   4. Marks LEADS_SYNC_CACHE[cacheKey] = "queued" (1hr TTL) immediately
  *      before calling — same "in flight" marker purpose as before, just
  *      renamed conceptually now that there's no queue. The delivery
  *      workers themselves flip this to "1" (7-day TTL) once actually
  *      delivered — this Worker never writes the "done" state, only "queued".
  *
- * Returns { routedCount } on success.
+ * Returns { routedCount, routedResults } on success, where routedResults is
+ * an array of { type, cacheKey, externalLeadId } for each destination
+ * actually routed this call (excludes ones skipped as already
+ * queued/done). routedCount is unchanged in meaning/shape from before —
+ * routedResults is purely additive.
  *
  * REQUIRED wrangler.toml:
  *   [[kv_namespaces]] binding = "LEADS_SYNC_CACHE"
@@ -76,9 +85,9 @@ export default {
     if (url.pathname === "/process-lead" && request.method === "POST") {
       try {
         const body = await request.json();
-        const routedCount = await processDiscoveredLead(body, env);
+        const { routedCount, routedResults } = await processDiscoveredLead(body, env);
         console.log(`✅ [queue-worker] Routed ${routedCount} destination(s) for one lead.`);
-        return new Response(JSON.stringify({ routedCount }), {
+        return new Response(JSON.stringify({ routedCount, routedResults }), {
           status: 200,
           headers: { "Content-Type": "application/json" },
         });
@@ -98,12 +107,14 @@ export default {
 // Processes ONE discovered lead: fans it out across its destinations,
 // deduplicating and calling the right delivery Worker for each. Returns
 // how many destinations were actually newly routed (excludes ones skipped
-// as already queued/done).
+// as already queued/done), plus the external CRM lead ID captured from
+// each (where the destination returns one).
 async function processDiscoveredLead(msg, env) {
   const { dealerKey, branchCode, intent, lead, approvalChance, destinations } = msg;
   const uniqueId = lead.idNumber || lead.mobileNumber || "unknown";
 
   let routedCount = 0;
+  const routedResults = [];
 
   for (const dest of destinations) {
     const cacheKey = branchCode
@@ -116,6 +127,8 @@ async function processDiscoveredLead(msg, env) {
     await env.LEADS_SYNC_CACHE.put(cacheKey, "queued", { expirationTtl: QUEUED_MARKER_TTL });
 
     try {
+      let externalLeadId = null;
+
       if (dest.type === "email") {
         const res = await env.DIGEST_WORKER.fetch("https://internal/accumulate", {
           method: "POST",
@@ -130,8 +143,17 @@ async function processDiscoveredLead(msg, env) {
           body: JSON.stringify({ dealerKey, branchCode, intent, dest, lead, approvalChance, cacheKey }),
         });
         if (!res.ok) throw new Error(`integration-worker responded ${res.status}`);
+
+        const data = await res.json().catch(() => ({}));
+        externalLeadId = data?.externalLeadId ?? null;
       }
+
       routedCount++;
+      routedResults.push({ type: dest.type, cacheKey, externalLeadId });
+
+      if (externalLeadId) {
+        console.log(`  ✅ [queue-worker] [${dest.type}] external lead ID: ${externalLeadId} (${cacheKey})`);
+      }
     } catch (err) {
       console.error(`  ❌ [queue-worker] Failed to route [${dest.type}] for ${cacheKey}: ${err.message}`);
       // Deliberately leave the "queued" marker in place rather than
@@ -142,5 +164,5 @@ async function processDiscoveredLead(msg, env) {
     }
   }
 
-  return routedCount;
+  return { routedCount, routedResults };
 }
