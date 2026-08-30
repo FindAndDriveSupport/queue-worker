@@ -70,6 +70,38 @@
  * queued/done). routedCount is unchanged in meaning/shape from before —
  * routedResults is purely additive.
  *
+ * ─────────────────────────────────────────────────────────────────────────
+ * POLICY-ONLY UPDATE — Body: { ..., policyOnlyUpdate: true } (added 2026-08-29)
+ * ─────────────────────────────────────────────────────────────────────────
+ * Sent by cron-worker once a policy number appears in D1 for a lead that
+ * was already fully synced on an earlier tick (see cron-worker's file
+ * header "POLICY NUMBER BACKFILL"). This is NOT a normal lead-forward —
+ * it does not run the queued/done dedup check above (that check answers
+ * "has this lead-destination pair been CREATED yet", which is already
+ * true and irrelevant here) and it never writes a "queued" marker.
+ *
+ * For each destination:
+ *   - "email" calls DIGEST_WORKER POST /update-policy-number with
+ *     { dealerKey, branchCode, uniqueId, date, policyNumber } — no
+ *     externalLeadId exists for the digest, so it amends the lead directly
+ *     inside the branch's current accumulation bucket if it's still there
+ *     (see digest-worker's file header "POLICY NUMBER BACKFILL"). A miss
+ *     (already sent) is a silent no-op, not an error.
+ *   - Every other destination requires the ORIGINAL delivery to have fully
+ *     completed (LEADS_SYNC_CACHE[cacheKey] === "1") and to have an
+ *     externalLeadId on record (LEADS_SYNC_CACHE[`${cacheKey}-external-id`]).
+ *     If either is missing, that destination is silently skipped — there's
+ *     nothing to attach the policy number to (either the original send
+ *     never finished, or that destination never returned an ID at all).
+ *   - Otherwise, calls INTEGRATION_WORKER POST /update-policy-number with
+ *     { dest, externalLeadId, policyNumber }. See integration-worker's
+ *     file header for which destinations actually support this yet
+ *     (HubSpot only, as of this change).
+ *
+ * routedResults entries for this path carry `policyNumberUpdated: true`
+ * instead of a freshly-created externalLeadId, to distinguish them from a
+ * normal create in any logging/monitoring built on this response shape.
+ *
  * REQUIRED wrangler.toml:
  *   [[kv_namespaces]] binding = "LEADS_SYNC_CACHE"
  *   [[services]] binding = "INTEGRATION_WORKER" service = "integration-worker"
@@ -109,8 +141,12 @@ export default {
 // how many destinations were actually newly routed (excludes ones skipped
 // as already queued/done), plus the external CRM lead ID captured from
 // each (where the destination returns one).
+//
+// When msg.policyOnlyUpdate is true, this instead fans a policy number
+// out to whichever destinations already have a completed delivery on
+// record — see file header "POLICY-ONLY UPDATE".
 async function processDiscoveredLead(msg, env) {
-  const { dealerKey, branchCode, intent, lead, approvalChance, destinations } = msg;
+  const { dealerKey, branchCode, intent, lead, approvalChance, destinations, policyOnlyUpdate } = msg;
   const uniqueId = lead.idNumber || lead.mobileNumber || "unknown";
 
   let routedCount = 0;
@@ -120,6 +156,60 @@ async function processDiscoveredLead(msg, env) {
     const cacheKey = branchCode
       ? `${dealerKey}-${branchCode}-${intent}-${dest.type}-${uniqueId}-${lead.date}`
       : `${dealerKey}-${intent}-${dest.type}-${uniqueId}-${lead.date}`;
+
+    if (policyOnlyUpdate) {
+      const done = await env.LEADS_SYNC_CACHE.get(cacheKey);
+      if (done !== "1") continue; // original delivery/accumulation never completed — nothing to update.
+
+      if (dest.type === "email") {
+        // digest-worker has no externalLeadId to look up — it amends the
+        // lead directly inside the branch's current accumulation bucket,
+        // if it's still sitting there (see digest-worker's file header
+        // "POLICY NUMBER BACKFILL" for why a miss here is a silent no-op:
+        // the digest may have already been sent).
+        try {
+          const res = await env.DIGEST_WORKER.fetch("https://internal/update-policy-number", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ dealerKey, branchCode, uniqueId, date: lead.date, policyNumber: lead.policyNumber }),
+          });
+          if (!res.ok) throw new Error(`digest-worker responded ${res.status}`);
+
+          const data = await res.json().catch(() => ({}));
+          if (data.updated) {
+            routedCount++;
+            routedResults.push({ type: dest.type, cacheKey, policyNumberUpdated: true });
+            console.log(`  ✅ [queue-worker] [email] policy number added to digest bucket (${cacheKey})`);
+          } else {
+            console.log(`  ⏭️  [queue-worker] [email] policy number not added — ${data.reason || "lead no longer in bucket"} (${cacheKey})`);
+          }
+        } catch (err) {
+          console.error(`  ❌ [queue-worker] Failed to push policy number [email] for ${cacheKey}: ${err.message}`);
+        }
+        continue;
+      }
+
+      const externalLeadId = await env.LEADS_SYNC_CACHE.get(`${cacheKey}-external-id`);
+      if (!externalLeadId) continue; // that destination never returned an ID to update against.
+
+      try {
+        const res = await env.INTEGRATION_WORKER.fetch("https://internal/update-policy-number", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ dest, externalLeadId, policyNumber: lead.policyNumber }),
+        });
+        if (!res.ok) throw new Error(`integration-worker responded ${res.status}`);
+
+        routedCount++;
+        routedResults.push({ type: dest.type, cacheKey, externalLeadId, policyNumberUpdated: true });
+        console.log(`  ✅ [queue-worker] [${dest.type}] policy number attached to ${externalLeadId} (${cacheKey})`);
+      } catch (err) {
+        console.error(`  ❌ [queue-worker] Failed to push policy number [${dest.type}] for ${cacheKey}: ${err.message}`);
+        // No marker to roll back here — cron-worker's own POLICY_FWD_MARKER_TTL
+        // marker stays unset on failure, so it retries on the next tick.
+      }
+      continue;
+    }
 
     const cached = await env.LEADS_SYNC_CACHE.get(cacheKey);
     if (cached) continue; // already "queued" (in flight) or "1" (done) — skip.
