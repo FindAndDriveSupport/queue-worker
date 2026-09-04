@@ -57,10 +57,12 @@
  *   "success"          — delivered successfully THIS call.
  *   "failed"           — attempted THIS call, delivery Worker threw/
  *                         returned non-2xx. Cache key's "queued" marker is
- *                         deliberately left in place (1hr TTL) so it
- *                         naturally expires and the next cron tick retries
- *                         it — same behavior as before, just now visible
- *                         to the caller instead of silently swallowed.
+ *                         now DELETED immediately (see BUGFIX comment at
+ *                         the catch block below) so the very next
+ *                         cron-worker retry (up to 5 min later) can
+ *                         genuinely re-attempt delivery, rather than
+ *                         silently blocking for up to an hour while the
+ *                         old "queued" TTL expired on its own.
  *   "skipped-done"      — LEADS_SYNC_CACHE already had "1" for this
  *                         destination — a PRIOR call already delivered it
  *                         successfully. Safe to treat as done.
@@ -308,14 +310,29 @@ async function processDiscoveredLead(msg, env) {
     } catch (err) {
       console.error(`  ❌ [queue-worker] Failed to route [${dest.type}] for ${cacheKey}: ${err.message}`);
       routedResults.push({ type: dest.type, cacheKey, status: "failed", externalLeadId: null, error: err.message });
-      // Deliberately leave the "queued" marker in place rather than
-      // deleting it — a delivery Worker failure here is usually transient
-      // (network blip, downstream API hiccup). Since this marker has a
-      // 1-hour TTL, it'll expire on its own; cron-worker no longer needs
-      // to wait for that expiry to know a retry is needed, though — its
-      // own forward marker now simply won't be set this tick (see its
-      // file header), so it retries the whole lead on the very next tick
-      // regardless of this TTL.
+
+      // BUGFIX (2026-09-04): CLEAR the "queued" marker on failure instead
+      // of leaving it in place. Leaving it in place was the original
+      // design — reasoned (at the time) as "a failure here is usually
+      // transient, and the 1-hour TTL will expire on its own." But once
+      // cron-worker started retrying failed leads every 5 minutes (see its
+      // "DEDUP BUGFIX" file header, deployed same day), that 1-hour TTL
+      // became an active bug: every retry within that hour saw this
+      // destination's cache key still "queued", recorded it as
+      // "skipped-inflight", and never called integration-worker again at
+      // all — a SILENT failure with no integration-worker log line to
+      // show for it, since integration-worker was simply never invoked.
+      // Confirmed in production 2026-09-04: cron-worker found 14
+      // car-factory-outlet leads and logged "sent 0 lead(s) to
+      // queue-worker" with zero corresponding integration-worker activity.
+      // Deleting the marker here means the very next retry (up to 5 min
+      // later) can genuinely re-attempt delivery, which is what
+      // cron-worker's own retry loop now expects and relies on.
+      try {
+        await env.LEADS_SYNC_CACHE.delete(cacheKey);
+      } catch (deleteErr) {
+        console.error(`  ⚠️  [queue-worker] Failed to clear "queued" marker for ${cacheKey} after delivery failure: ${deleteErr.message}`);
+      }
     }
   }
 
