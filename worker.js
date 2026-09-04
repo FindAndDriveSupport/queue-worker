@@ -30,9 +30,51 @@
  * finish) before moving to the next lead. Retry is also no longer
  * automatic — a failed call here means cron-worker's lead-level dedup
  * marker (see its file header) is never written, so the same lead gets
- * retried whole on the NEXT dispatch tick (up to 30 min later) rather than
+ * retried whole on the NEXT dispatch tick (up to 5 min later) rather than
  * a queue's near-immediate automatic retry. Acceptable for this volume;
  * revisit if per-branch invocation duration becomes a real problem.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * PER-DESTINATION STATUS REPORTING (added 2026-09-04)
+ * ─────────────────────────────────────────────────────────────────────────
+ * PRIOR BUG: cron-worker marked a lead "forwarded" (3-day marker, see its
+ * file header) as soon as THIS Worker returned any 200 — regardless of
+ * whether any individual destination actually succeeded. Since this
+ * Worker's own /process-lead handler always returns 200 as long as it
+ * doesn't crash outright (per-destination failures are caught and logged,
+ * not thrown — see the try/catch below), a lead whose DealerOS delivery
+ * failed (e.g. during the multi-day DealerOS 503 outage, 2026-08-22 to
+ * 2026-09-04) still got marked "fully forwarded" by cron-worker. Once
+ * marked, cron-worker's marker outlives the 2-day Seriti lookback window
+ * by design (3-day TTL), so the lead could NEVER be reconsidered or
+ * retried — it was silently and permanently lost from DealerOS's
+ * perspective, even though queue-worker and integration-worker logs
+ * showed nothing crash-level wrong.
+ *
+ * FIX: on the NORMAL forward path only (not policyOnlyUpdate — see that
+ * section below), routedResults now reports a status for EVERY
+ * destination in the call, not just ones newly attempted this invocation:
+ *   "success"          — delivered successfully THIS call.
+ *   "failed"           — attempted THIS call, delivery Worker threw/
+ *                         returned non-2xx. Cache key's "queued" marker is
+ *                         deliberately left in place (1hr TTL) so it
+ *                         naturally expires and the next cron tick retries
+ *                         it — same behavior as before, just now visible
+ *                         to the caller instead of silently swallowed.
+ *   "skipped-done"      — LEADS_SYNC_CACHE already had "1" for this
+ *                         destination — a PRIOR call already delivered it
+ *                         successfully. Safe to treat as done.
+ *   "skipped-inflight"  — LEADS_SYNC_CACHE already had "queued" for this
+ *                         destination — another call is (or was, if the
+ *                         1hr TTL hasn't expired yet) mid-attempt. NOT
+ *                         safe to treat as done — this is exactly the
+ *                         ambiguous state that caused the original bug,
+ *                         so it's now surfaced explicitly rather than
+ *                         silently skipped.
+ *
+ * cron-worker now only writes its 3-day "fully forwarded" marker when
+ * EVERY destination's status is "success" or "skipped-done" — see its own
+ * file header for the corresponding fix.
  *
  * ─────────────────────────────────────────────────────────────────────────
  * CALL CONTRACT — POST /process-lead (from cron-worker)
@@ -45,9 +87,10 @@
  *   1. Computes the same cacheKey scheme used throughout the pipeline:
  *      branchCode ? `${dealerKey}-${branchCode}-${intent}-${dest.type}-${uniqueId}-${lead.date}`
  *                 : `${dealerKey}-${intent}-${dest.type}-${uniqueId}-${lead.date}`
- *   2. Checks LEADS_SYNC_CACHE[cacheKey] — skips if already "queued" (in
- *      flight) or "1" (done).
- *   3. Calls the right downstream Worker via Service Binding:
+ *   2. Checks LEADS_SYNC_CACHE[cacheKey] — records "skipped-done" or
+ *      "skipped-inflight" (see above) and moves on without calling
+ *      anything, if already "1" or "queued" respectively.
+ *   3. Otherwise calls the right downstream Worker via Service Binding:
  *        dest.type === "email"  → DIGEST_WORKER  POST /accumulate
  *          body: { dealerKey, branchCode, intent, lead, cacheKey }
  *          — no dest needed; digest-worker never used one, even before.
@@ -64,11 +107,12 @@
  *      workers themselves flip this to "1" (7-day TTL) once actually
  *      delivered — this Worker never writes the "done" state, only "queued".
  *
- * Returns { routedCount, routedResults } on success, where routedResults is
- * an array of { type, cacheKey, externalLeadId } for each destination
- * actually routed this call (excludes ones skipped as already
- * queued/done). routedCount is unchanged in meaning/shape from before —
- * routedResults is purely additive.
+ * Returns { routedCount, routedResults } on success. routedCount is the
+ * number of destinations newly delivered successfully THIS call (status
+ * "success" only — unchanged meaning from before). routedResults on the
+ * normal forward path is now an array covering EVERY destination passed
+ * in, each { type, cacheKey, status, externalLeadId } — see
+ * "PER-DESTINATION STATUS REPORTING" above.
  *
  * ─────────────────────────────────────────────────────────────────────────
  * POLICY-ONLY UPDATE — Body: { ..., policyOnlyUpdate: true } (added 2026-08-29)
@@ -101,6 +145,11 @@
  * routedResults entries for this path carry `policyNumberUpdated: true`
  * instead of a freshly-created externalLeadId, to distinguish them from a
  * normal create in any logging/monitoring built on this response shape.
+ * NOTE: the policyOnlyUpdate path is a distinct, best-effort, one-shot
+ * update — it deliberately does NOT get the "status" field treatment
+ * added above, since cron-worker's own policyFwdKey marker (separate from
+ * forwardKey) already governs its own retry logic independently. See
+ * cron-worker's file header "POLICY NUMBER BACKFILL".
  *
  * REQUIRED wrangler.toml:
  *   [[kv_namespaces]] binding = "LEADS_SYNC_CACHE"
@@ -137,10 +186,11 @@ export default {
 };
 
 // Processes ONE discovered lead: fans it out across its destinations,
-// deduplicating and calling the right delivery Worker for each. Returns
-// how many destinations were actually newly routed (excludes ones skipped
-// as already queued/done), plus the external CRM lead ID captured from
-// each (where the destination returns one).
+// deduplicating and calling the right delivery Worker for each. On the
+// normal forward path, routedResults now covers EVERY destination with a
+// status (see file header "PER-DESTINATION STATUS REPORTING") so the
+// caller (cron-worker) can tell a truly-fully-delivered lead apart from
+// one that merely didn't crash.
 //
 // When msg.policyOnlyUpdate is true, this instead fans a policy number
 // out to whichever destinations already have a completed delivery on
@@ -211,8 +261,19 @@ async function processDiscoveredLead(msg, env) {
       continue;
     }
 
+    // ── Normal forward path — see file header "PER-DESTINATION STATUS
+    // REPORTING". Every destination gets a routedResults entry now, not
+    // just newly-attempted ones, so cron-worker can tell "fully delivered"
+    // from "queue-worker merely didn't crash".
     const cached = await env.LEADS_SYNC_CACHE.get(cacheKey);
-    if (cached) continue; // already "queued" (in flight) or "1" (done) — skip.
+    if (cached === "1") {
+      routedResults.push({ type: dest.type, cacheKey, status: "skipped-done", externalLeadId: null });
+      continue;
+    }
+    if (cached === "queued") {
+      routedResults.push({ type: dest.type, cacheKey, status: "skipped-inflight", externalLeadId: null });
+      continue;
+    }
 
     await env.LEADS_SYNC_CACHE.put(cacheKey, "queued", { expirationTtl: QUEUED_MARKER_TTL });
 
@@ -239,18 +300,22 @@ async function processDiscoveredLead(msg, env) {
       }
 
       routedCount++;
-      routedResults.push({ type: dest.type, cacheKey, externalLeadId });
+      routedResults.push({ type: dest.type, cacheKey, status: "success", externalLeadId });
 
       if (externalLeadId) {
         console.log(`  ✅ [queue-worker] [${dest.type}] external lead ID: ${externalLeadId} (${cacheKey})`);
       }
     } catch (err) {
       console.error(`  ❌ [queue-worker] Failed to route [${dest.type}] for ${cacheKey}: ${err.message}`);
+      routedResults.push({ type: dest.type, cacheKey, status: "failed", externalLeadId: null, error: err.message });
       // Deliberately leave the "queued" marker in place rather than
       // deleting it — a delivery Worker failure here is usually transient
       // (network blip, downstream API hiccup). Since this marker has a
-      // 1-hour TTL, it'll expire and the NEXT lead-forward retry from
-      // cron-worker will pick this destination back up naturally.
+      // 1-hour TTL, it'll expire on its own; cron-worker no longer needs
+      // to wait for that expiry to know a retry is needed, though — its
+      // own forward marker now simply won't be set this tick (see its
+      // file header), so it retries the whole lead on the very next tick
+      // regardless of this TTL.
     }
   }
 
